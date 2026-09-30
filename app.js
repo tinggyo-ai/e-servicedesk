@@ -7,6 +7,13 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const bcrypt = require('bcryptjs');
+
+// 비밀번호는 bcrypt 해시로만 저장한다.
+// 과거 평문 저장분은 로그인 성공 시점에 한 번씩 해시로 전환된다(무중단 이행).
+const BCRYPT_ROUNDS = 10;
+const isHashed = (v) => typeof v === 'string' && /^\$2[aby]\$/.test(v);
+const hashPassword = (pw) => bcrypt.hashSync(pw, BCRYPT_ROUNDS);
 
 const PORT = process.env.PORT || 3000;
 // 클라우드(Fly.io)에서는 DB_PATH 환경변수로 볼륨 경로 사용
@@ -125,7 +132,8 @@ db.exec(`
 // 마스터 관리자 시드 (없을 때만)
 const masterExists = db.prepare("SELECT id FROM admin_accounts WHERE username='admin'").get();
 if (!masterExists) {
-  db.prepare("INSERT INTO admin_accounts (username, password, role) VALUES ('admin', '1234', 'master')").run();
+  const initialPw = process.env.ADMIN_INITIAL_PASSWORD || '1234';
+  db.prepare("INSERT INTO admin_accounts (username, password, role) VALUES ('admin', ?, 'master')").run(hashPassword(initialPw));
 }
 
 // 기존 DB에 컬럼 추가 (이미 있으면 무시)
@@ -220,7 +228,17 @@ app.post('/api/auth/login', (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return fail(res, '아이디와 비밀번호를 입력하세요.');
     const account = db.prepare('SELECT * FROM admin_accounts WHERE username=?').get(username);
-    if (!account || account.password !== password) return fail(res, '아이디 또는 비밀번호가 올바르지 않습니다.');
+    let valid = false;
+    if (account) {
+      if (isHashed(account.password)) {
+        valid = bcrypt.compareSync(password, account.password);
+      } else if (account.password === password) {
+        // 과거 평문 저장분 — 검증에 성공했으므로 지금 해시로 바꿔 둔다
+        valid = true;
+        db.prepare('UPDATE admin_accounts SET password=? WHERE id=?').run(hashPassword(password), account.id);
+      }
+    }
+    if (!valid) return fail(res, '아이디 또는 비밀번호가 올바르지 않습니다.');
     const token = makeToken();
     sessions.set(token, { username: account.username, role: account.role, name: account.name || account.username });
     ok(res, { token, username: account.username, role: account.role, name: account.name || account.username });
@@ -315,7 +333,7 @@ app.post('/api/admins', requireAuth, requireMaster, (req, res) => {
     const r = db.prepare(`
       INSERT INTO admin_accounts (username, password, role, name, team, employee_id, granted_at)
       VALUES (?, ?, 'sub', ?, ?, ?, ?)
-    `).run(username, password, name, team, employee_id, granted_at);
+    `).run(username, hashPassword(password), name, team, employee_id, granted_at);
     ok(res, { id: r.lastInsertRowid });
   } catch (e) { fail(res, e.message, 500); }
 });
